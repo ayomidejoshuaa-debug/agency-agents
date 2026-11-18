@@ -22,8 +22,8 @@ exec /bin/cp "$@"
 EOF
 chmod +x "$scratch/bin/cp"
 export PATH="$scratch/bin:$PATH" TMPDIR="$scratch/tmp"
-expected_status=0
-printf 'failure\n' | xargs -P 2 -I {} sh -c 'exit 47' || expected_status=$?
+# A failed worker ends the run like a sequential failure: exit 1, naming the tool.
+expected_status=1
 status=0
 bash "$scratch/repo/scripts/install.sh" --tool claude-code,copilot --division engineering \
   --no-convert --parallel --jobs 2 > "$scratch/failure.log" 2>&1 || status=$?
@@ -31,6 +31,10 @@ bash "$scratch/repo/scripts/install.sh" --tool claude-code,copilot --division en
 grep -q 'fixture worker copy failed' "$scratch/failure.log" || {
   echo 'FAIL: buffered worker failure is hidden' >&2; exit 1;
 }
+grep -q 'Failed: claude-code' "$scratch/failure.log" || {
+  echo 'FAIL: failed parallel tool is not named' >&2; exit 1;
+}
+grep -q 'Installed 1 of 2 tool(s)' "$scratch/failure.log"
 [[ -f "$HOME/.github/agents/first.md" ]]
 ! grep -q 'Done!  Installed' "$scratch/failure.log"
 [[ -z "$(ls -A "$scratch/tmp")" ]] || { echo 'FAIL: worker output directory leaked'; exit 1; }

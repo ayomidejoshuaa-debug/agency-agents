@@ -285,16 +285,18 @@ selected_agent_count_all() {
   local d n=0; for d in "${ALL_DIVISIONS[@]}"; do incr_by n "$(division_count "$d")"; done; echo "$n"
 }
 
-# worker_flags — re-emit the active selection/mode flags for parallel workers.
+# worker_flags — re-emit the active selection/mode flags for parallel workers,
+# one NUL-terminated argument each. A single space-joined string split
+# "Frontend Developer" or a --path with a space into separate arguments.
 worker_flags() {
-  local out="" d a
-  $USE_LINK && out="$out --link"
-  $AUTO_CONVERT || out="$out --no-convert"
-  [[ -n "$OVERRIDE_PATH" ]] && out="$out --path $OVERRIDE_PATH"
-  for d in ${FILTER_DIVISIONS[@]+"${FILTER_DIVISIONS[@]}"}; do out="$out --division $d"; done
-  for a in ${FILTER_AGENTS[@]+"${FILTER_AGENTS[@]}"}; do out="$out --agent $a"; done
-  [[ -n "$AGENTS_FILE" ]] && out="$out --agents-file $AGENTS_FILE"
-  printf '%s' "$out"
+  local d a
+  $USE_LINK && printf '%s\0' --link
+  $AUTO_CONVERT || printf '%s\0' --no-convert
+  [[ -n "$OVERRIDE_PATH" ]] && printf '%s\0' --path "$OVERRIDE_PATH"
+  for d in ${FILTER_DIVISIONS[@]+"${FILTER_DIVISIONS[@]}"}; do printf '%s\0' --division "$d"; done
+  for a in ${FILTER_AGENTS[@]+"${FILTER_AGENTS[@]}"}; do printf '%s\0' --agent "$a"; done
+  [[ -n "$AGENTS_FILE" ]] && printf '%s\0' --agents-file "$AGENTS_FILE"
+  return 0
 }
 
 # validate_division <name> — exit on unknown division.
@@ -336,9 +338,39 @@ install_file() {
   fi
   if $USE_LINK; then
     ln -s "$1" "$target"
-  else
-    cp "$1" "$2"
+    return 0
   fi
+  local dir name
+  dir="$(dirname "$target")"; name="$(basename "$target")"
+  # Copy mode used to overwrite any regular file at the destination, including
+  # one the user had edited. Keep a backup unless the file is identical to the
+  # source or is exactly what this installer wrote there last time.
+  if [[ -f "$target" ]] && ! cmp -s "$1" "$target" \
+     && ! _manifest_has "$dir" "$name" "$(_file_sum "$target")"; then
+    local backup="$target.bak-${BACKUP_STAMP:-$(date +%Y%m%d%H%M%S)}"
+    cp -p "$target" "$backup"
+    [[ -n "${BACKUP_LOG:-}" ]] && printf '%s\n' "$backup" >> "$BACKUP_LOG"
+  fi
+  cp "$1" "$target"
+  _manifest_record "$dir" "$name" "$(_file_sum "$target")"
+}
+
+# Per-directory record of the files this installer copied, so a re-install
+# can tell its own stale copy (safe to replace) from a file the user edited
+# (backed up first). Lines are "<cksum> <size><TAB><filename>".
+INSTALL_MANIFEST_NAME=".agency-agents-installed"
+_file_sum() { cksum < "$1" | awk '{print $1" "$2}'; }
+_manifest_has() {  # <dir> <name> <sum>
+  local m="$1/$INSTALL_MANIFEST_NAME"
+  [[ -f "$m" ]] || return 1
+  awk -F'\t' -v n="$2" -v s="$3" '$1 == s && $2 == n { f = 1 } END { exit !f }' "$m"
+}
+_manifest_record() {  # <dir> <name> <sum>
+  local m="$1/$INSTALL_MANIFEST_NAME" tmp
+  tmp="$(mktemp "$m.XXXXXX")"
+  [[ -f "$m" ]] && awk -F'\t' -v n="$2" '$2 != n' "$m" > "$tmp"
+  printf '%s\t%s\n' "$3" "$2" >> "$tmp"
+  mv -f "$tmp" "$m"
 }
 
 # resolve_dest <tool> <default> — --path > $ENV_VAR > default.
@@ -732,7 +764,9 @@ _teams_summary() {
 }
 _teams_warn() {
   local a cap; a="$(_teams_agents)"; cap="$(tool_cap opencode)"
-  if _opencode_selected && [[ "$a" -gt "$cap" ]]; then
+  if [[ "$a" -eq 0 ]]; then
+    printf '⚠ No teams selected — pick at least one to continue'
+  elif _opencode_selected && [[ "$a" -gt "$cap" ]]; then
     printf "⚠ OpenCode registers ~%s; ~%s of %s won't load (#27988)" "$cap" "$(( a - cap ))" "$a"
   fi
 }
@@ -740,6 +774,10 @@ _opencode_selected() {
   local i; for (( i=0; i<${#TOOL_SEL[@]}; i++ )); do
     [[ "${ALL_TOOLS[$i]}" == "opencode" && "${TOOL_SEL[$i]}" == 1 ]] && return 0
   done; return 1
+}
+_any_team_selected() {
+  local i; for (( i=0; i<${#TEAM_SEL[@]}; i++ )); do [[ "${TEAM_SEL[$i]}" == 1 ]] && return 0; done
+  return 1
 }
 screen_teams() {
   OPT_LABEL=(); OPT_SEL=()
@@ -836,7 +874,9 @@ interactive_wizard() {
   while true; do
     case "$screen" in
       tools)  screen_tools;  case "$SEL_RESULT" in next) screen=teams;; quit) tui_end; exit 0;; esac ;;
-      teams)  screen_teams;  case "$SEL_RESULT" in next) screen=review;; back) screen=tools;; quit) tui_end; exit 0;; esac ;;
+      # An empty team set must not reach build_selection: no filter there
+      # means "install everything", the opposite of what was picked.
+      teams)  screen_teams;  case "$SEL_RESULT" in next) _any_team_selected && screen=review;; back) screen=tools;; quit) tui_end; exit 0;; esac ;;
       review) screen_review; case "$REVIEW_RESULT" in install) break;; back) screen=teams;; quit) tui_end; exit 0;; esac ;;
     esac
   done
@@ -850,6 +890,10 @@ interactive_wizard() {
   for (( i=0; i<${#TEAM_SEL[@]}; i++ )); do [[ "${TEAM_SEL[$i]}" == 1 ]] || all=0; done
   if [[ "$all" == 0 ]]; then
     for (( i=0; i<${#TEAM_SEL[@]}; i++ )); do [[ "${TEAM_SEL[$i]}" == 1 ]] && FILTER_DIVISIONS+=("${ALL_DIVISIONS[$i]}"); done
+  fi
+  if [[ ${#FILTER_DIVISIONS[@]} -eq 0 && "$all" == 0 ]]; then
+    err "No teams selected — nothing to install."
+    exit 1
   fi
   build_selection
   return 0
@@ -1475,7 +1519,11 @@ if insert_at is None:
 lines.insert(insert_at, new_item_line)
 path.write_text("\n".join(lines) + "\n")
 PY
-  if [[ -f "$backup" ]]; then
+  # Re-runs used to leave a new backup each time even when nothing changed.
+  if [[ -f "$backup" ]] && cmp -s "$config" "$backup"; then
+    rm -f -- "$backup"
+    ok "Hermes: plugin $plugin already enabled in $config"
+  elif [[ -f "$backup" ]]; then
     ok "Hermes: enabled plugin $plugin in $config (backup: $backup)"
   else
     ok "Hermes: created config.yaml with plugins.enabled: $plugin"
@@ -1498,6 +1546,12 @@ install_hermes() {
   fi
   [[ -f "$src/plugin.yaml" && -f "$src/__init__.py" && -f "$src/data/agents.json" ]] || {
     err "integrations/hermes/agency-agents-router missing. Run ./scripts/convert.sh --tool hermes first."
+    return 1
+  }
+  # Check before anything is replaced: python3 enables the plugin in
+  # config.yaml, and finding it missing afterwards left a half-done install.
+  command -v python3 >/dev/null 2>&1 || {
+    err "Hermes: python3 is required to enable the plugin in config.yaml, and was not found."
     return 1
   }
   mkdir -p "$(dirname "$dest")"
@@ -1534,7 +1588,7 @@ from pathlib import Path
 import json, sys
 print(len(json.loads(Path(sys.argv[1]).read_text())))
 PY
-)"
+)" || count="?"
   ok "Hermes: lazy-router plugin ($count agents on disk) -> $dest"
   warn "Hermes: restart sessions/gateway so the new plugin toolset is discovered."
   if $SELECTION_ACTIVE; then
@@ -1569,9 +1623,23 @@ install_tool() {
 # Entry point
 # ---------------------------------------------------------------------------
 main() {
-  SKIPPED_LOG="$(mktemp "${TMPDIR:-/tmp}/agency-install-skipped.XXXXXX")"
-  export SKIPPED_LOG
-  trap 'rm -f "$SKIPPED_LOG"' EXIT
+  # Parallel workers inherit the parent's logs so its summary sees what they
+  # skipped and backed up; only the process that created them removes them.
+  if [[ -z "${AGENCY_INSTALL_WORKER:-}" || -z "${SKIPPED_LOG:-}" ]]; then
+    SKIPPED_LOG="$(mktemp "${TMPDIR:-/tmp}/agency-install-skipped.XXXXXX")"
+    BACKUP_LOG="$(mktemp "${TMPDIR:-/tmp}/agency-install-backups.XXXXXX")"
+    BACKUP_STAMP="$(date +%Y%m%d%H%M%S)"
+    export SKIPPED_LOG BACKUP_LOG BACKUP_STAMP
+    AGENCY_CLEANUP='rm -f "$SKIPPED_LOG" "$BACKUP_LOG"'
+    trap "$AGENCY_CLEANUP" EXIT
+  fi
+  # A parallel worker gets the parent's selection/mode flags from a
+  # NUL-separated file so arguments containing spaces survive intact.
+  if [[ -n "${AGENCY_INSTALL_WORKER:-}" && -f "${AGENCY_INSTALL_ARGS_FILE:-}" ]]; then
+    local _wa=() _a
+    while IFS= read -r -d '' _a; do _wa+=("$_a"); done < "$AGENCY_INSTALL_ARGS_FILE"
+    set -- "$@" ${_wa[@]+"${_wa[@]}"}
+  fi
   local tool="all"
   local interactive_mode="auto"
   local use_parallel=false
@@ -1639,7 +1707,7 @@ main() {
       fi
       $duplicate || _cleaned+=("$_t")
     done
-    _tool_list=("${_cleaned[@]}")
+    _tool_list=(${_cleaned[@]+"${_cleaned[@]}"})
   fi
 
   # Decide whether to show interactive UI
@@ -1656,7 +1724,7 @@ main() {
     : # wizard committed SELECTED_TOOLS + FILTER_DIVISIONS
 
   elif [[ "$tool" != "all" ]]; then
-    SELECTED_TOOLS=("${_tool_list[@]}")
+    SELECTED_TOOLS=(${_tool_list[@]+"${_tool_list[@]}"})
 
   else
     # Non-interactive (or no TTY): auto-detect
@@ -1738,14 +1806,20 @@ main() {
     install_out_dir="$(mktemp -d)"
     export AGENCY_INSTALL_OUT_DIR="$install_out_dir"
     export AGENCY_INSTALL_SCRIPT="$SCRIPT_DIR/install.sh"
-    export AGENCY_INSTALL_EXTRA="$(worker_flags)"
-    printf '%s\n' "${SELECTED_TOOLS[@]}" | xargs -P "$parallel_jobs" -I {} sh -c 'AGENCY_INSTALL_WORKER=1 "$AGENCY_INSTALL_SCRIPT" --tool "{}" --no-interactive $AGENCY_INSTALL_EXTRA > "$AGENCY_INSTALL_OUT_DIR/{}" 2>&1' || install_status=$?
+    export AGENCY_INSTALL_ARGS_FILE="$install_out_dir/.args"
+    worker_flags > "$AGENCY_INSTALL_ARGS_FILE"
+    printf '%s\n' "${SELECTED_TOOLS[@]}" | xargs -P "$parallel_jobs" -I {} sh -c 'AGENCY_INSTALL_WORKER=1 "$AGENCY_INSTALL_SCRIPT" --tool "{}" --no-interactive > "$AGENCY_INSTALL_OUT_DIR/{}" 2>&1; echo $? > "$AGENCY_INSTALL_OUT_DIR/{}.rc"' || install_status=$?
     for t in "${SELECTED_TOOLS[@]}"; do
       [[ -f "$install_out_dir/$t" ]] && cat "$install_out_dir/$t"
+      if [[ "$(cat "$install_out_dir/$t.rc" 2>/dev/null)" == 0 ]]; then
+        (( installed++ )) || true
+      else
+        failed+=("$t")
+      fi
     done
     rm -rf "$install_out_dir"
-    [[ "$install_status" -eq 0 ]] || return "$install_status"
-    installed=$n_selected
+    # xargs itself failing (not a worker) leaves no per-tool status to report.
+    if [[ "$install_status" -ne 0 && ${#failed[@]} -eq 0 ]]; then return "$install_status"; fi
   else
     for t in "${SELECTED_TOOLS[@]}"; do
       (( i++ )) || true
@@ -1789,6 +1863,11 @@ main() {
     warn "Not installed: $(wc -l < "$SKIPPED_LOG" | tr -d ' ') file(s) whose destination is an existing user file or foreign symlink:"
     sed 's/^/    /' "$SKIPPED_LOG" >&2
     warn "Move or remove those destinations, then re-run to install them."
+  fi
+  if [[ -s "$BACKUP_LOG" ]]; then
+    warn "Backed up $(wc -l < "$BACKUP_LOG" | tr -d ' ') existing file(s) that differed from what this installer last wrote (edited by you, or from an install before backups existed):"
+    sed 's/^/    /' "$BACKUP_LOG" >&2
+    dim "  Delete the .bak-* files once you've checked them."
   fi
   dim "  Run ./scripts/convert.sh to regenerate after adding or editing agents."
   printf "\n"

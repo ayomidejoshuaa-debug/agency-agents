@@ -68,3 +68,6 @@ jobs:
 
       - name: Keep installing after one tool fails, then exit non-zero
         run: bash scripts/test-install-continue-after-failure.sh
+
+      - name: Keep user edits, refuse empty team selection, keep parallel args intact
+        run: bash scripts/test-install-safety.sh

@@ -170,7 +170,11 @@ tui_begin() {
   stty -echo -icanon time 0 min 1 2>/dev/null || return 1
   printf '\033[?1049h\033[?25l'   # alt screen + hide cursor
   _TUI_ACTIVE=1
-  trap 'tui_end' EXIT INT TERM
+  # Chain onto the caller's cleanup (AGENCY_CLEANUP) instead of replacing it,
+  # and actually exit on Ctrl-C: a handler that only restores the terminal
+  # lets bash resume the key loop on the normal screen.
+  trap 'tui_end; eval "${AGENCY_CLEANUP:-:}"' EXIT
+  trap 'tui_end; exit 130' INT TERM
 }
 
 # tui_end — restore terminal (idempotent; safe from trap).
@@ -179,7 +183,8 @@ tui_end() {
   printf '\033[?25h\033[?1049l'   # show cursor + leave alt screen
   [[ -n "$_TUI_STTY_SAVE" ]] && stty "$_TUI_STTY_SAVE" 2>/dev/null
   _TUI_ACTIVE=0
-  trap - EXIT INT TERM
+  trap - INT TERM
+  if [[ -n "${AGENCY_CLEANUP:-}" ]]; then trap "$AGENCY_CLEANUP" EXIT; else trap - EXIT; fi
 }
 
 # read_key — read one keypress, echo a normalized token:
